@@ -1,6 +1,29 @@
-/* ============================================================
- * server.c - Central TCP Parking Server with City & Price CLI
- * ============================================================ */
+/**
+ * @file    server.c
+ * @brief   Central TCP parking server with SQLite database and price CLI.
+ *
+ * Responsibilities:
+ *  - Accept TCP connections from BeagleBone boards (one thread per client).
+ *  - Receive ParkingData_t packets, reply ACK (0x06) or NACK (0x15).
+ *  - Track parking sessions: START opens a session, END closes it and the
+ *    fee is computed as  base_rate + hourly_rate * (seconds / 3600)
+ *    using the tariff of the city detected from the GPS coordinates.
+ *  - Store every packet and its fee in the customer_data table (SQLite).
+ *  - Manage city prices from an interactive console menu
+ *    (add / update / remove / show).
+ *  - On SIGUSR1, reload prices from PRICES_FILE (lines: city,hourly,base).
+ *
+ * Threads:
+ *  - main thread    : accept() loop
+ *  - client threads : one per connected client
+ *  - console thread : price management menu on stdin
+ *  - signal thread  : waits for SIGUSR1 with sigwait()
+ *
+ * Synchronization: db_lock protects the SQLite connection, sessions_lock
+ * protects the session table, log_lock protects the log file.
+ *
+ * Build: gcc -Wall -pthread server.c -o server -lsqlite3
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,24 +39,30 @@
 
 #include "common.h"
 
-#define PORT          8080
-#define LOG_FILE      "server.log"
-#define DB_FILE       "parking.db"
-#define PRICES_FILE   "prices.txt"   /* SIGUSR1 -> reload prices from this file */
-#define MAX_CITIES    64
-#define MAX_SESSIONS  128
-#define MSG_START     1
-#define MSG_END       2
-#define ACK_BYTE      0x06
-#define NACK_BYTE     0x15
+#define PORT          8080          /**< TCP listening port */
+#define LOG_FILE      "server.log"  /**< Server log file */
+#define DB_FILE       "parking.db"  /**< SQLite database file */
+#define PRICES_FILE   "prices.txt"  /**< Prices reloaded on SIGUSR1 (city,hourly,base) */
+#define MAX_CITIES    64            /**< Max cities listed in the CLI */
+#define MAX_SESSIONS  128           /**< Max concurrent open parking sessions */
+#define MSG_START     1             /**< msg_type: parking started */
+#define MSG_END       2             /**< msg_type: parking ended */
+#define ACK_BYTE      0x06          /**< Reply: packet accepted */
+#define NACK_BYTE     0x15          /**< Reply: packet rejected */
 
-static sqlite3 *db = NULL;
-static pthread_mutex_t db_lock  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static sqlite3 *db = NULL;                                    /**< SQLite connection */
+static pthread_mutex_t db_lock  = PTHREAD_MUTEX_INITIALIZER;  /**< Protects db */
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;  /**< Protects the log file */
 
 /* ============================================================
- * Logger Function
+ * Logger
  * ============================================================ */
+
+/**
+ * @brief  Thread-safe: append a timestamped line to LOG_FILE.
+ * @param  level   Severity string: "INFO", "WARN" or "ERROR"
+ * @param  format  printf-style format string, followed by its arguments
+ */
 void write_log(const char *level, const char *format, ...) {
     pthread_mutex_lock(&log_lock);
     FILE *file = fopen(LOG_FILE, "a");
@@ -60,8 +89,19 @@ void write_log(const char *level, const char *format, ...) {
  * Dynamic City & Price Management Functions
  * ============================================================ */
 
-/* הרצת פקודת SQL על טבלת המחירים עם פרמטרים (בטוח לשמות עם רווחים/גרש)
- * מחזיר מספר שורות שהשתנו, או -1 בשגיאה */
+/**
+ * @brief  Run a parameterized SQL statement on the prices table.
+ *
+ * Uses a prepared statement, so city names with spaces or quotes are safe.
+ * Binds ?1 = city and, if bind_rates is set, ?2 = hourly, ?3 = base.
+ *
+ * @param  sql          SQL text with ?1 (and optionally ?2, ?3) placeholders
+ * @param  city         City name bound to ?1
+ * @param  bind_rates   Non-zero to also bind hourly_rate and base_rate
+ * @param  hourly_rate  Value bound to ?2
+ * @param  base_rate    Value bound to ?3
+ * @return Number of changed rows, or -1 on SQL error
+ */
 static int exec_price_sql(const char *sql, const char *city, int bind_rates,
                           double hourly_rate, double base_rate) {
     sqlite3_stmt *stmt = NULL;
@@ -84,7 +124,13 @@ static int exec_price_sql(const char *sql, const char *city, int bind_rates,
     return changes;
 }
 
-/* הוספת עיר חדשה (נכשל אם העיר כבר קיימת) */
+/**
+ * @brief  Add a new city to the prices table.
+ * @param  city_name    City name
+ * @param  hourly_rate  Price per hour (NIS)
+ * @param  base_rate    Fixed price per parking session (NIS)
+ * @note   Does nothing (prints a message) if the city already exists.
+ */
 void add_city_price(const char *city_name, double hourly_rate, double base_rate) {
     int n = exec_price_sql("INSERT OR IGNORE INTO prices (city, hourly_rate, base_rate) VALUES (?1, ?2, ?3);",
                            city_name, 1, hourly_rate, base_rate);
@@ -96,7 +142,12 @@ void add_city_price(const char *city_name, double hourly_rate, double base_rate)
     }
 }
 
-/* עדכון מחיר לעיר קיימת */
+/**
+ * @brief  Update the prices of an existing city.
+ * @param  city_name    City name (must exist)
+ * @param  hourly_rate  New price per hour (NIS)
+ * @param  base_rate    New fixed price per session (NIS)
+ */
 void update_city_price(const char *city_name, double hourly_rate, double base_rate) {
     int n = exec_price_sql("UPDATE prices SET hourly_rate = ?2, base_rate = ?3 WHERE city = ?1;",
                            city_name, 1, hourly_rate, base_rate);
@@ -108,7 +159,10 @@ void update_city_price(const char *city_name, double hourly_rate, double base_ra
     }
 }
 
-/* הסרת עיר ממחירון השרת */
+/**
+ * @brief  Remove a city from the prices table.
+ * @param  city_name  City name
+ */
 void remove_city(const char *city_name) {
     int n = exec_price_sql("DELETE FROM prices WHERE city = ?1;", city_name, 0, 0, 0);
     if (n == 1) {
@@ -119,7 +173,13 @@ void remove_city(const char *city_name) {
     }
 }
 
-/* שליפת מחיר עיר. מחזיר 0 אם נמצאה, -1 אם לא */
+/**
+ * @brief  Read the tariff of a city.
+ * @param  city         City name
+ * @param[out] hourly_rate  Price per hour
+ * @param[out] base_rate    Fixed price per session
+ * @return 0 if the city was found, -1 otherwise (outputs unchanged)
+ */
 static int get_city_price(const char *city, double *hourly_rate, double *base_rate) {
     sqlite3_stmt *stmt = NULL;
     int found = -1;
@@ -139,7 +199,12 @@ static int get_city_price(const char *city, double *hourly_rate, double *base_ra
     return found;
 }
 
-/* הדפסת כל המחירונים עם מספור. ממלא את cities (אם לא NULL) ומחזיר את מספר הערים */
+/**
+ * @brief  Print the price table as a numbered list.
+ * @param[out] cities  If not NULL, receives the city names in display order
+ *                     (array of MAX_CITIES strings of 64 chars)
+ * @return Number of cities printed
+ */
 int show_all_prices(char cities[][64]) {
     sqlite3_stmt *stmt = NULL;
     int count = 0;
@@ -163,16 +228,27 @@ int show_all_prices(char cities[][64]) {
     return count;
 }
 
-/* זיהוי עיר לפי קואורדינטות GPS */
+/**
+ * @brief  Map GPS coordinates to a city name.
+ * @param  lat  Latitude in degrees
+ * @param  lon  Longitude in degrees
+ * @return "Tel Aviv" inside its bounding box, otherwise "DefaultCity"
+ */
 const char* get_city_from_coordinates(double lat, double lon) {
-    // בדיקת קואורדינטות עבור תל אביב (32.0853, 34.7818)
+    /* Tel Aviv bounding box (center 32.0853, 34.7818) */
     if (lat >= 32.00 && lat <= 32.15 && lon >= 34.70 && lon <= 34.85) {
         return "Tel Aviv";
     }
     return "DefaultCity";
 }
 
-/* טעינת מחירים מקובץ (כל שורה: city,hourly,base) - נקרא כשמגיע SIGUSR1 */
+/**
+ * @brief  Load prices from PRICES_FILE into the database (called on SIGUSR1).
+ *
+ * Each line has the form  city,hourly_rate,base_rate  (e.g. "Haifa,20,3").
+ * Existing cities are updated, new cities are added (upsert).
+ * Invalid lines are ignored.
+ */
 static void reload_prices_from_file(void) {
     FILE *f = fopen(PRICES_FILE, "r");
     if (!f) {
@@ -196,8 +272,22 @@ static void reload_prices_from_file(void) {
 }
 
 /* ============================================================
- * Database Operations
+ * Database
  * ============================================================ */
+
+/**
+ * @brief  Open the SQLite database and create the tables if needed.
+ *
+ * Tables:
+ *  - prices(city PK, hourly_rate, base_rate)
+ *  - customer_data(id, client_id, msg_type, latitude, longitude,
+ *                  timestamp, calculated_fee, created_at)
+ *
+ * Default prices are inserted only if missing, so prices changed by the
+ * user are kept across restarts.
+ *
+ * @return 0 on success, -1 on error
+ */
 int init_database(void) {
     if (sqlite3_open(DB_FILE, &db) != SQLITE_OK) {
         write_log("ERROR", "Cannot open database: %s", sqlite3_errmsg(db));
@@ -205,15 +295,15 @@ int init_database(void) {
     }
 
     const char *sql =
-        /* 1. טבלת מחירונים לפי ערים */
+        /* prices table */
         "CREATE TABLE IF NOT EXISTS prices ("
         "city TEXT PRIMARY KEY, hourly_rate REAL, base_rate REAL);"
-        /* 2. טבלת customer_data */
+        /* parking records table */
         "CREATE TABLE IF NOT EXISTS customer_data ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, msg_type INTEGER, "
         "latitude REAL, longitude REAL, timestamp INTEGER, calculated_fee REAL, "
         "created_at DATETIME DEFAULT (datetime('now', 'localtime')));"
-        /* ערכי ברירת מחדל - רק אם לא קיימים, כדי לא לדרוס עדכונים של המשתמש */
+        /* default prices - only if missing */
         "INSERT OR IGNORE INTO prices VALUES ('Tel Aviv', 15.00, 5.00);"
         "INSERT OR IGNORE INTO prices VALUES ('DefaultCity', 10.00, 5.00);";
 
@@ -232,15 +322,22 @@ int init_database(void) {
 /* ============================================================
  * Parking Sessions (START -> END)
  * ============================================================ */
+/** @brief An open parking session (between START and END). */
 typedef struct {
-    int      used;
-    uint16_t client_id;
-    uint32_t start_ts;
+    int      used;       /**< 1 if this slot holds an open session */
+    uint16_t client_id;  /**< Client that started parking */
+    uint32_t start_ts;   /**< Timestamp of the START message */
 } Session_t;
 
-static Session_t sessions[MAX_SESSIONS];
-static pthread_mutex_t sessions_lock = PTHREAD_MUTEX_INITIALIZER;
+static Session_t sessions[MAX_SESSIONS];                          /**< Open sessions */
+static pthread_mutex_t sessions_lock = PTHREAD_MUTEX_INITIALIZER; /**< Protects sessions */
 
+/**
+ * @brief  Open (or restart) the parking session of a client.
+ * @param  id  Client ID
+ * @param  ts  START timestamp
+ * @note   If the table is full the START is silently dropped.
+ */
 static void session_start(uint16_t id, uint32_t ts) {
     pthread_mutex_lock(&sessions_lock);
     int slot = -1;
@@ -256,7 +353,12 @@ static void session_start(uint16_t id, uint32_t ts) {
     pthread_mutex_unlock(&sessions_lock);
 }
 
-/* מחזיר 0 ואת זמן ההתחלה אם היה START, אחרת -1 */
+/**
+ * @brief  Close the parking session of a client.
+ * @param  id  Client ID
+ * @param[out] start_ts  Timestamp of the matching START
+ * @return 0 if a session was found and closed, -1 if there was no START
+ */
 static int session_end(uint16_t id, uint32_t *start_ts) {
     int rc = -1;
     pthread_mutex_lock(&sessions_lock);
@@ -272,19 +374,29 @@ static int session_end(uint16_t id, uint32_t *start_ts) {
     return rc;
 }
 
-/* שמירת נתוני חנייה + חישוב המחיר לפי זמן החנייה ומחיר העיר.
- * מחזיר 0 -> ACK, -1 -> NACK */
+/**
+ * @brief  Process one parking packet: update sessions, compute the fee and
+ *         store the record in customer_data.
+ *
+ *  - msg_type 0 (no data): ignored, ACK.
+ *  - START: opens a session, record stored with fee 0.
+ *  - END:   closes the session, fee = base + hourly * seconds / 3600.
+ *  - Other msg_type: rejected (NACK).
+ *
+ * @param  data  Packet received from the client
+ * @return 0 -> reply ACK, -1 -> reply NACK
+ */
 int save_customer_parking(const ParkingData_t *data) {
-    if (data->msg_type == 0) return 0;   /* אין הודעה חדשה */
+    if (data->msg_type == 0) return 0;   /* no new data */
     if (data->msg_type != MSG_START && data->msg_type != MSG_END) {
         write_log("WARN", "Unknown msg_type %u from client %u", data->msg_type, data->client_id);
         return -1;
     }
 
-    /* 1. זיהוי העיר לפי קואורדינטות ה-GPS */
+    /* 1. Detect the city from the GPS coordinates */
     const char *city_name = get_city_from_coordinates(data->latitude, data->longitude);
 
-    /* 2. חישוב המחיר: START = 0, END = בסיס + תעריף שעתי * שעות */
+    /* 2. Fee: START = 0, END = base + hourly * hours */
     double calculated_fee = 0.0;
     if (data->msg_type == MSG_START) {
         session_start(data->client_id, data->timestamp);
@@ -306,7 +418,7 @@ int save_customer_parking(const ParkingData_t *data) {
         }
     }
 
-    /* 3. הכנסת הרשומה לטבלה */
+    /* 3. Store the record */
     sqlite3_stmt *stmt = NULL;
     int rc = -1;
     pthread_mutex_lock(&db_lock);
@@ -335,7 +447,13 @@ int save_customer_parking(const ParkingData_t *data) {
  * Interactive Console Thread (CLI)
  * ============================================================ */
 
-/* קריאת שורה מהמקלדת (מאפשר שמות עם רווחים, כמו Tel Aviv) */
+/**
+ * @brief  Print a prompt and read one line from stdin (spaces allowed).
+ * @param  prompt  Text to print
+ * @param[out] buf  Destination buffer (newline removed)
+ * @param  size    Buffer size
+ * @return Length of the line, or -1 on EOF
+ */
 static int read_line(const char *prompt, char *buf, size_t size) {
     printf("%s", prompt);
     fflush(stdout);
@@ -344,7 +462,14 @@ static int read_line(const char *prompt, char *buf, size_t size) {
     return (int)strlen(buf);
 }
 
-/* קריאת מחיר. Enter ריק = השארת הערך הנוכחי (אם keep_allowed) */
+/**
+ * @brief  Read a non-negative price from stdin.
+ * @param  prompt        Text to print
+ * @param  current       Value returned when the user presses Enter (if allowed)
+ * @param  keep_allowed  Non-zero: empty input keeps @p current
+ * @param[out] out       The price entered
+ * @return 0 on success, -1 on invalid input or EOF
+ */
 static int read_rate(const char *prompt, double current, int keep_allowed, double *out) {
     char buf[32], *end;
     if (read_line(prompt, buf, sizeof(buf)) < 0) return -1;
@@ -358,7 +483,11 @@ static int read_rate(const char *prompt, double current, int keep_allowed, doubl
     return 0;
 }
 
-/* בחירת עיר מהרשימה לפי מספר. מחזיר 0 ומעתיק את השם, או -1 */
+/**
+ * @brief  Show the numbered price list and let the user pick a city.
+ * @param[out] city_out  Selected city name (at least 64 chars)
+ * @return 0 on valid selection, -1 otherwise
+ */
 static int choose_city(char *city_out) {
     char cities[MAX_CITIES][64], buf[16];
     int n = show_all_prices(cities);
@@ -373,6 +502,12 @@ static int choose_city(char *city_out) {
     return 0;
 }
 
+/**
+ * @brief  Console thread: price management menu
+ *         (1 Add, 2 Update, 3 Remove, 4 Show).
+ * @param  arg  Unused
+ * @return Never returns
+ */
 void *console_thread_handler(void *arg) {
     (void)arg;
     char buf[16], city[64];
@@ -429,9 +564,18 @@ void *console_thread_handler(void *arg) {
 }
 
 /* ============================================================
- * Signal Thread - SIGUSR1 reloads prices from PRICES_FILE
- * (handled with sigwait, so it is safe to use printf/SQLite here)
+ * Signal thread
  * ============================================================ */
+
+/**
+ * @brief  Signal thread: waits for SIGUSR1 and reloads prices from file.
+ *
+ * SIGUSR1 is blocked in all threads and received here synchronously with
+ * sigwait(), so it is safe to call printf() and SQLite functions.
+ *
+ * @param  arg  Pointer to the sigset_t containing SIGUSR1
+ * @return Never returns
+ */
 void *signal_thread_handler(void *arg) {
     sigset_t *set = arg;
     int sig;
@@ -448,8 +592,17 @@ void *signal_thread_handler(void *arg) {
  * Client Thread
  * ============================================================ */
 
-/* קריאה של בדיוק len בתים (TCP יכול לחלק הודעה לכמה חלקים)
- * מחזיר 1 = הודעה מלאה, 0 = הלקוח התנתק, -1 = שגיאה */
+/**
+ * @brief  Receive exactly @p len bytes from a TCP socket.
+ *
+ * TCP is a byte stream, so one recv() may return only part of a packet.
+ * This function loops until the whole packet has arrived.
+ *
+ * @param  fd   Connected socket
+ * @param[out] buf  Destination buffer (at least @p len bytes)
+ * @param  len  Number of bytes to read
+ * @return 1 = full packet, 0 = peer closed cleanly, -1 = error / partial close
+ */
 static int recv_all(int fd, void *buf, size_t len) {
     size_t got = 0;
     while (got < len) {
@@ -464,11 +617,17 @@ static int recv_all(int fd, void *buf, size_t len) {
     return 1;
 }
 
+/** @brief Arguments passed to a client thread. */
 typedef struct {
-    int  fd;
-    char ip[INET_ADDRSTRLEN];
+    int  fd;                     /**< Client socket */
+    char ip[INET_ADDRSTRLEN];    /**< Client IP address (for logs) */
 } ClientInfo_t;
 
+/**
+ * @brief  Client thread: receive packets, process them, reply ACK/NACK.
+ * @param  arg  Heap-allocated ClientInfo_t (freed by this thread)
+ * @return NULL when the client disconnects
+ */
 void *client_thread_handler(void *arg) {
     ClientInfo_t client = *(ClientInfo_t *)arg;
     free(arg);
@@ -489,7 +648,7 @@ void *client_thread_handler(void *arg) {
         printf("\n[Server] Received -> ID: %u, Type: %u, Lat: %.6f, Lon: %.6f, Time: %u\n",
                data.client_id, data.msg_type, data.latitude, data.longitude, data.timestamp);
 
-        /* שמירה ב-DB ושליחת ACK/NACK בחזרה ל-Process 1 */
+        /* Store in DB and reply ACK/NACK to process 1 */
         uint8_t reply = (save_customer_parking(&data) == 0) ? ACK_BYTE : NACK_BYTE;
         if (send(client.fd, &reply, 1, MSG_NOSIGNAL) != 1) {
             write_log("ERROR", "Send ACK to %s failed", client.ip);
@@ -504,13 +663,19 @@ void *client_thread_handler(void *arg) {
 /* ============================================================
  * Main
  * ============================================================ */
+
+/**
+ * @brief  Entry point: init DB, start signal and console threads, then
+ *         accept clients forever (one thread per client).
+ * @return EXIT_FAILURE on initialization error; otherwise never returns.
+ */
 int main(void) {
-    /* SIGUSR1 מטופל רק ב-signal thread (חוסמים אותו בכל שאר ה-threads) */
+    /* Block SIGUSR1 in all threads - only the signal thread receives it */
     static sigset_t sig_set;
     sigemptyset(&sig_set);
     sigaddset(&sig_set, SIGUSR1);
     pthread_sigmask(SIG_BLOCK, &sig_set, NULL);
-    signal(SIGPIPE, SIG_IGN);   /* לקוח שהתנתק לא יפיל את השרת */
+    signal(SIGPIPE, SIG_IGN);   /* a disconnected client must not kill the server */
 
     write_log("INFO", "Starting Server Application...");
 
@@ -578,7 +743,7 @@ int main(void) {
         printf("\n[Server] New connection from %s\n", client->ip);
         write_log("INFO", "Client connected from IP: %s", client->ip);
 
-        /* thread נפרד לכל לקוח - השרת ממשיך לקבל חיבורים חדשים */
+        /* One thread per client - main thread keeps accepting */
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread_handler, client) != 0) {
             write_log("ERROR", "Failed to create client thread");
@@ -593,3 +758,4 @@ int main(void) {
     sqlite3_close(db);
     return 0;
 }
+
