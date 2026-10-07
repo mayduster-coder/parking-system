@@ -1,0 +1,13 @@
+PROJECT_NAME           = "Parking System"
+PROJECT_BRIEF          = "STM32 + BeagleBone + TCP server + SQLite"
+OUTPUT_DIRECTORY       = docs
+INPUT                  = README.md common bbg server stm32/RTG
+FILE_PATTERNS          = *.c *.h *.md
+RECURSIVE              = YES
+USE_MDFILE_AS_MAINPAGE = README.md
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+QUIET                  = YES

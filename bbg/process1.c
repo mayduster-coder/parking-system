@@ -1,12 +1,21 @@
-/* ============================================================
- * process1.c - Ethernet Communication Process (BeagleBone)
- * ============================================================ */
+/**
+ * @file    process1.c
+ * @brief   BeagleBone process 1 - Ethernet (TCP client) communication.
+ *
+ * Reads ParkingData_t packets that process 2 writes to the FIFO and forwards
+ * each one to the central TCP server over Ethernet. After every packet it
+ * waits for a 1-byte reply from the server (0x06 = ACK, 0x15 = NACK).
+ * If the connection drops, the process reconnects automatically.
+ *
+ * Data flow: process2 --(FIFO /tmp/gps_fifo)--> process1 --(TCP)--> server
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <time.h>
@@ -14,14 +23,20 @@
 
 #include "common.h"
 
-#define PIPE_PATH "/tmp/gps_fifo"
-#define SERVER_IP "192.168.10.1"/* IP של השרת במחשב */
-#define SERVER_PORT 8080
-#define LOG_FILE "process1.log"
+#define PIPE_PATH    "/tmp/gps_fifo"   /**< FIFO shared with process 2 */
+#define SERVER_IP    "192.168.10.1"    /**< Server IP (VM, Ethernet link) */
+#define SERVER_PORT  8080              /**< Server TCP port */
+#define LOG_FILE     "process1.log"    /**< Log file of this process */
 
-/* ============================================================
- * Logger Function (Section 6 - Logging and Monitoring)
- * ============================================================ */
+/**
+ * @brief  Append a timestamped line to the log file.
+ *
+ * Opens and closes the file on every call so the log is always flushed,
+ * even if the process is killed.
+ *
+ * @param  level   Severity string: "INFO", "WARN" or "ERROR"
+ * @param  format  printf-style format string, followed by its arguments
+ */
 void write_log(const char *level, const char *format, ...) {
     FILE *file = fopen(LOG_FILE, "a");
     if (!file) return;
@@ -42,9 +57,12 @@ void write_log(const char *level, const char *format, ...) {
     fclose(file);
 }
 
-/* ============================================================
- * TCP Connection
- * ============================================================ */
+/**
+ * @brief  Create a TCP socket and connect it to SERVER_IP:SERVER_PORT.
+ *
+ * @return Connected socket descriptor on success, -1 on failure
+ *         (the socket is closed on failure, nothing leaks).
+ */
 int connect_to_server(void) {
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd < 0) {
@@ -71,13 +89,23 @@ int connect_to_server(void) {
     return sock_fd;
 }
 
-/* ============================================================
- * Main
- * ============================================================ */
+/**
+ * @brief  Entry point: open the FIFO, connect to the server, then forward
+ *         packets forever.
+ *
+ * Steps:
+ *  -# Open the FIFO O_RDWR so open() does not block while process 2 is
+ *     not running yet.
+ *  -# Connect to the server, retrying every 3 seconds until it succeeds.
+ *  -# Loop: read one ParkingData_t from the FIFO, send it to the server,
+ *     wait for the ACK byte. On send failure, reconnect.
+ *
+ * @return EXIT_FAILURE if the FIFO cannot be opened; otherwise never returns.
+ */
 int main(void) {
     write_log("INFO", "Starting Process 1 (Ethernet Manager)...");
 
-    /* 1. פתיחת ה-PIPE לקריאה מ-Process 2 בשיטת O_RDWR למניעת חסימות */
+    /* 1. Open the FIFO (O_RDWR prevents blocking until a writer exists) */
     printf("[Process 1] Opening FIFO pipe at %s...\n", PIPE_PATH);
     int pipe_fd = open(PIPE_PATH, O_RDWR);
     if (pipe_fd < 0) {
@@ -88,12 +116,12 @@ int main(void) {
     printf("[Process 1] FIFO opened successfully!\n");
     write_log("INFO", "FIFO pipe opened successfully.");
 
-    /* 2. התחברות לשרת TCP */
+    /* 2. Connect to the TCP server (retry until success) */
     int sock_fd = -1;
     while (sock_fd < 0) {
         printf("[Process 1] Attempting to connect to TCP Server at %s:%d...\n", SERVER_IP, SERVER_PORT);
         write_log("INFO", "Attempting connection to TCP Server at %s:%d", SERVER_IP, SERVER_PORT);
-        
+
         sock_fd = connect_to_server();
         if (sock_fd < 0) {
             printf("[Process 1] Connection failed. Retrying in 3 seconds...\n");
@@ -106,21 +134,21 @@ int main(void) {
 
     ParkingData_t data;
 
-    /* 3. לולאה ראשית: קריאה רציפה מה-Pipe ושליחה לשרת */
+    /* 3. Main loop: FIFO -> TCP server */
     while (1) {
         ssize_t bytes_read = read(pipe_fd, &data, sizeof(ParkingData_t));
-        
+
         if (bytes_read == sizeof(ParkingData_t)) {
-            printf("[Process 1] Read %zd bytes from Pipe (Client ID: %u). Sending to Server...\n", 
+            printf("[Process 1] Read %zd bytes from Pipe (Client ID: %u). Sending to Server...\n",
                    bytes_read, data.client_id);
             write_log("INFO", "Read packet from Pipe (Client ID: %u). Forwarding to Server...", data.client_id);
 
-            /* שליחה לשרת TCP */
+            /* Send the packet to the server */
             ssize_t bytes_sent = send(sock_fd, &data, sizeof(ParkingData_t), 0);
             if (bytes_sent <= 0) {
                 perror("[Process 1 Error] Send to server failed, reconnecting...");
                 write_log("ERROR", "Send to server failed. Attempting to reconnect...");
-                
+
                 close(sock_fd);
                 sock_fd = -1;
                 while (sock_fd < 0) {
@@ -131,7 +159,7 @@ int main(void) {
                 continue;
             }
 
-            /* קבלת תשובת ACK מהשרת */
+            /* Wait for the server reply (0x06 = ACK, 0x15 = NACK) */
             uint8_t ack_response = 0;
             ssize_t ack_bytes = recv(sock_fd, &ack_response, sizeof(ack_response), 0);
             if (ack_bytes > 0) {
@@ -143,7 +171,7 @@ int main(void) {
             }
 
         } else if (bytes_read <= 0) {
-            /* הצינור ריק כרגע - ממתינים 100ms וממשיכים בלולאה */
+            /* FIFO empty - wait 100 ms and try again */
             usleep(100000);
         }
     }
