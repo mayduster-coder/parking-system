@@ -1,0 +1,12 @@
+*.o
+*.d
+*.elf
+*.map
+*.su
+*.cyclo
+bbg/process1
+bbg/process2
+server/server
+stm32/Debug/
+*.db
+*.log
