@@ -25,6 +25,7 @@ if pgrep -x server >/dev/null; then
     echo "[start] Stopping old server instance..."
     pkill -x server
     sleep 1
+    pkill -9 -x server 2>/dev/null
 fi
 
 # 3. Build
