@@ -1,0 +1,16 @@
+# Process 1 - reads the FIFO and forwards the data to the TCP server
+[Unit]
+Description=Parking System - Process 1 (Ethernet TCP client)
+After=network-online.target parking-i2c.service
+Wants=network-online.target parking-i2c.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/parking
+ExecStart=/opt/parking/process1 /opt/parking/process1.conf
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

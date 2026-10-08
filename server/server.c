@@ -11,7 +11,9 @@
  *  - Store every packet and its fee in the customer_data table (SQLite).
  *  - Manage city prices from an interactive console menu
  *    (add / update / remove / show).
- *  - On SIGUSR1, reload prices from PRICES_FILE (lines: city,hourly,base).
+ *  - On SIGUSR1, reload prices from the prices file (lines: city,hourly,base).
+ *  - Settings (port, file names) are read at startup from a CONFIG file
+ *    (default "server.conf", or the path given as the first argument).
  *
  * Threads:
  *  - main thread    : accept() loop
@@ -23,6 +25,7 @@
  * protects the session table, log_lock protects the log file.
  *
  * Build: gcc -Wall -pthread server.c -o server -lsqlite3
+ * Run:   ./server [config_file]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,16 +42,22 @@
 
 #include "common.h"
 
-#define PORT          8080          /**< TCP listening port */
-#define LOG_FILE      "server.log"  /**< Server log file */
-#define DB_FILE       "parking.db"  /**< SQLite database file */
-#define PRICES_FILE   "prices.txt"  /**< Prices reloaded on SIGUSR1 (city,hourly,base) */
+#define DEFAULT_CONFIG "server.conf" /**< Config file used when no argument is given */
+#define PATH_LEN       128           /**< Max length of a file path in the config */
 #define MAX_CITIES    64            /**< Max cities listed in the CLI */
 #define MAX_SESSIONS  128           /**< Max concurrent open parking sessions */
 #define MSG_START     1             /**< msg_type: parking started */
 #define MSG_END       2             /**< msg_type: parking ended */
 #define ACK_BYTE      0x06          /**< Reply: packet accepted */
 #define NACK_BYTE     0x15          /**< Reply: packet rejected */
+
+/* ============================================================
+ * Configuration (defaults, overridden by the CONFIG file)
+ * ============================================================ */
+static int  g_port = 8080;                          /**< TCP listening port */
+static char g_log_file[PATH_LEN]    = "server.log"; /**< Server log file */
+static char g_db_file[PATH_LEN]     = "parking.db"; /**< SQLite database file */
+static char g_prices_file[PATH_LEN] = "prices.txt"; /**< Prices reloaded on SIGUSR1 */
 
 static sqlite3 *db = NULL;                                    /**< SQLite connection */
 static pthread_mutex_t db_lock  = PTHREAD_MUTEX_INITIALIZER;  /**< Protects db */
@@ -59,13 +68,13 @@ static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;  /**< Protects the 
  * ============================================================ */
 
 /**
- * @brief  Thread-safe: append a timestamped line to LOG_FILE.
+ * @brief  Thread-safe: append a timestamped line to the log file.
  * @param  level   Severity string: "INFO", "WARN" or "ERROR"
  * @param  format  printf-style format string, followed by its arguments
  */
 void write_log(const char *level, const char *format, ...) {
     pthread_mutex_lock(&log_lock);
-    FILE *file = fopen(LOG_FILE, "a");
+    FILE *file = fopen(g_log_file, "a");
     if (file) {
         time_t now = time(NULL);
         struct tm t;
@@ -83,6 +92,75 @@ void write_log(const char *level, const char *format, ...) {
         fclose(file);
     }
     pthread_mutex_unlock(&log_lock);
+}
+
+/* ============================================================
+ * Configuration file
+ * ============================================================ */
+
+/**
+ * @brief  Remove leading and trailing whitespace in place.
+ * @param  s  String to trim
+ * @return Pointer to the first non-space character of @p s
+ */
+static char *trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n'))
+        *--end = '\0';
+    return s;
+}
+
+/**
+ * @brief  Load settings from a KEY=VALUE config file.
+ *
+ * Supported keys: PORT, DB_FILE, LOG_FILE, PRICES_FILE.
+ * Empty lines and lines starting with '#' are ignored. Unknown keys and
+ * invalid values are reported and ignored. If the file does not exist the
+ * built-in defaults are kept.
+ *
+ * @param  path  Config file path
+ * @return 0 if the file was read, -1 if it could not be opened
+ */
+static int load_config(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("[Config] %s not found - using defaults\n", path);
+        return -1;
+    }
+
+    char line[256];
+    int line_no = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line_no++;
+        char *p = trim(line);
+        if (*p == '\0' || *p == '#') continue;
+
+        char *eq = strchr(p, '=');
+        if (!eq) {
+            printf("[Config] %s:%d ignored (no '=')\n", path, line_no);
+            continue;
+        }
+        *eq = '\0';
+        char *key = trim(p);
+        char *value = trim(eq + 1);
+
+        if (strcmp(key, "PORT") == 0) {
+            int port = atoi(value);
+            if (port > 0 && port < 65536) g_port = port;
+            else printf("[Config] %s:%d invalid PORT '%s'\n", path, line_no, value);
+        } else if (strcmp(key, "DB_FILE") == 0) {
+            snprintf(g_db_file, PATH_LEN, "%s", value);
+        } else if (strcmp(key, "LOG_FILE") == 0) {
+            snprintf(g_log_file, PATH_LEN, "%s", value);
+        } else if (strcmp(key, "PRICES_FILE") == 0) {
+            snprintf(g_prices_file, PATH_LEN, "%s", value);
+        } else {
+            printf("[Config] %s:%d unknown key '%s'\n", path, line_no, key);
+        }
+    }
+    fclose(f);
+    return 0;
 }
 
 /* ============================================================
@@ -243,17 +321,17 @@ const char* get_city_from_coordinates(double lat, double lon) {
 }
 
 /**
- * @brief  Load prices from PRICES_FILE into the database (called on SIGUSR1).
+ * @brief  Load prices from the prices file into the database (called on SIGUSR1).
  *
  * Each line has the form  city,hourly_rate,base_rate  (e.g. "Haifa,20,3").
  * Existing cities are updated, new cities are added (upsert).
  * Invalid lines are ignored.
  */
 static void reload_prices_from_file(void) {
-    FILE *f = fopen(PRICES_FILE, "r");
+    FILE *f = fopen(g_prices_file, "r");
     if (!f) {
-        printf("\n[Signal] Cannot open %s\n", PRICES_FILE);
-        write_log("WARN", "SIGUSR1: cannot open %s: %s", PRICES_FILE, strerror(errno));
+        printf("\n[Signal] Cannot open %s\n", g_prices_file);
+        write_log("WARN", "SIGUSR1: cannot open %s: %s", g_prices_file, strerror(errno));
         return;
     }
 
@@ -289,7 +367,7 @@ static void reload_prices_from_file(void) {
  * @return 0 on success, -1 on error
  */
 int init_database(void) {
-    if (sqlite3_open(DB_FILE, &db) != SQLITE_OK) {
+    if (sqlite3_open(g_db_file, &db) != SQLITE_OK) {
         write_log("ERROR", "Cannot open database: %s", sqlite3_errmsg(db));
         return -1;
     }
@@ -581,7 +659,7 @@ void *signal_thread_handler(void *arg) {
     int sig;
     while (1) {
         if (sigwait(set, &sig) == 0 && sig == SIGUSR1) {
-            printf("\n[Signal] SIGUSR1 received. Reloading prices from %s...\n", PRICES_FILE);
+            printf("\n[Signal] SIGUSR1 received. Reloading prices from %s...\n", g_prices_file);
             reload_prices_from_file();
         }
     }
@@ -665,11 +743,18 @@ void *client_thread_handler(void *arg) {
  * ============================================================ */
 
 /**
- * @brief  Entry point: init DB, start signal and console threads, then
- *         accept clients forever (one thread per client).
+ * @brief  Entry point: load config, init DB, start signal and console
+ *         threads, then accept clients forever (one thread per client).
+ * @param  argc  Argument count
+ * @param  argv  argv[1] (optional) = config file path
  * @return EXIT_FAILURE on initialization error; otherwise never returns.
  */
-int main(void) {
+int main(int argc, char *argv[]) {
+    const char *config_path = (argc > 1) ? argv[1] : DEFAULT_CONFIG;
+    load_config(config_path);
+    printf("[Config] PORT=%d DB_FILE=%s LOG_FILE=%s PRICES_FILE=%s\n",
+           g_port, g_db_file, g_log_file, g_prices_file);
+
     /* Block SIGUSR1 in all threads - only the signal thread receives it */
     static sigset_t sig_set;
     sigemptyset(&sig_set);
@@ -704,11 +789,11 @@ int main(void) {
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+    address.sin_port = htons(g_port);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("Bind failed");
-        write_log("ERROR", "Bind failed on port %d", PORT);
+        write_log("ERROR", "Bind failed on port %d", g_port);
         close(server_fd);
         exit(EXIT_FAILURE);
     }
@@ -721,8 +806,8 @@ int main(void) {
     }
 
     printf("[Server PID: %d] Ready.\n", getpid());
-    printf("Server listening on port %d...\n", PORT);
-    write_log("INFO", "Server listening on port %d with PID %d", PORT, getpid());
+    printf("Server listening on port %d...\n", g_port);
+    write_log("INFO", "Server listening on port %d with PID %d (config: %s)", g_port, getpid(), config_path);
 
     while (1) {
         struct sockaddr_in client_addr;
@@ -758,4 +843,3 @@ int main(void) {
     sqlite3_close(db);
     return 0;
 }
-

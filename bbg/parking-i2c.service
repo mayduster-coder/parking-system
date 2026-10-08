@@ -1,0 +1,15 @@
+# Process 2 - reads GPS data from the STM32 over I2C and writes it to the FIFO
+[Unit]
+Description=Parking System - Process 2 (I2C reader)
+After=multi-user.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/parking
+ExecStart=/opt/parking/process2
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
