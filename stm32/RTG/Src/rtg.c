@@ -2,6 +2,10 @@
  * @file    rtg.c
  * @brief   GPS emulator - STM32 acts as I2C slave (Listen mode) and serves
  *          ParkingData_t packets to the BeagleBone master.
+ *
+ * Parking sessions follow real time: pressing the blue user button (B1)
+ * sends START, pressing it again sends END. The blue LED (LD2) is on while
+ * the car is parked.
  * @author  may1
  * @date    Sep 22, 2026
  */
@@ -43,10 +47,62 @@ static uint32_t get_rtc_timestamp(void)
 }
 
 /**
- * @brief Initialize the emulator data. No message is pending at start.
+ * @brief Configure the user button (input) and the parking LED (output).
+ *
+ * Done here so no change is needed in the CubeMX GPIO configuration.
+ */
+static void parking_gpio_init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    gpio.Pin  = PARK_BUTTON_PIN;            /* B1: external pull-down on the board */
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(PARK_BUTTON_PORT, &gpio);
+
+    gpio.Pin   = PARK_LED_PIN;              /* LD2 blue LED */
+    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull  = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(PARK_LED_PORT, &gpio);
+    HAL_GPIO_WritePin(PARK_LED_PORT, PARK_LED_PIN, GPIO_PIN_RESET);
+}
+
+/**
+ * @brief  Detect a debounced button press (rising edge).
+ * @return 1 once per press, 0 otherwise
+ */
+static uint8_t button_pressed(void)
+{
+    static uint8_t  stable_state = 0;   /* last debounced state */
+    static uint8_t  last_raw     = 0;
+    static uint32_t last_change  = 0;
+
+    uint8_t raw = (HAL_GPIO_ReadPin(PARK_BUTTON_PORT, PARK_BUTTON_PIN) == GPIO_PIN_SET);
+
+    if (raw != last_raw) {              /* input changed - restart debounce timer */
+        last_raw    = raw;
+        last_change = HAL_GetTick();
+        return 0;
+    }
+
+    if (raw != stable_state && (HAL_GetTick() - last_change) >= BUTTON_DEBOUNCE_MS) {
+        stable_state = raw;
+        return stable_state;            /* 1 only on press, not on release */
+    }
+    return 0;
+}
+
+/**
+ * @brief Initialize the emulator data and GPIOs. No message is pending at start.
  */
 void GPS_Emulator_Init(void)
 {
+    parking_gpio_init();
+
     gps_data.client_id = 101;
     gps_data.msg_type  = MSG_NONE;
     gps_data.latitude  = 32.085300;
@@ -86,18 +142,18 @@ void GPS_Emulator_Update_Data(uint8_t type, double lat, double lon)
 }
 
 /**
- * @brief Call from the main loop. Emulates a parking session (START/END
- *        alternately) and re-arms Listen mode if an error left it idle.
+ * @brief Call from the main loop. Each button press toggles the parking
+ *        state (START / END), so the session length is real time.
+ *        Also re-arms Listen mode if an error left it idle.
  */
 void GPS_Emulator_Task(void)
 {
-    static uint32_t last_tick = 0;
-    static uint8_t  parked = 0;
+    static uint8_t parked = 0;
 
-    if (HAL_GetTick() - last_tick >= PARK_TOGGLE_PERIOD_MS) {
-        last_tick = HAL_GetTick();
+    if (button_pressed()) {
         parked = !parked;
         GPS_Emulator_Update_Data(parked ? MSG_START : MSG_END, 32.085300, 34.781800);
+        HAL_GPIO_WritePin(PARK_LED_PORT, PARK_LED_PIN, parked ? GPIO_PIN_SET : GPIO_PIN_RESET);
     }
 
     /* Safety net: if the peripheral dropped out of Listen mode, re-arm it */

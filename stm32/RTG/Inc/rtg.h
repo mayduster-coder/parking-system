@@ -27,8 +27,16 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(ParkingData_t) == 23, "ParkingData_t must match Linux common.h");
 
-/** @brief Time between START and END messages (emulated parking session) */
-#define PARK_TOGGLE_PERIOD_MS  20000U
+/** @brief User button B1 on the Nucleo-144 (PC13, reads 1 when pressed) */
+#define PARK_BUTTON_PORT       GPIOC
+#define PARK_BUTTON_PIN        GPIO_PIN_13
+
+/** @brief Blue LED LD2 (PB7) - ON while the car is parked */
+#define PARK_LED_PORT          GPIOB
+#define PARK_LED_PIN           GPIO_PIN_7
+
+/** @brief Button must be stable this long to count as a press (debounce) */
+#define BUTTON_DEBOUNCE_MS     50U
 
 void GPS_Emulator_Init(void);
 void GPS_Emulator_Start_Listening(I2C_HandleTypeDef *hi2c);
